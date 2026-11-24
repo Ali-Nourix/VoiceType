@@ -1,0 +1,36 @@
+name: Windows GUI smoke (temporary branch)
+on:
+  push:
+    branches: ['fix/desktop-reliability']
+permissions:
+  contents: write
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore lockfile
+        shell: pwsh
+        run: ./scripts/restore-lock.ps1
+      - name: Build
+        run: cargo build --release --locked
+      - name: GUI smoke with fake audio
+        shell: pwsh
+        run: ./scripts/windows-ui-smoke.ps1
+      - name: Upload QA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-smoke
+          path: qa-output/
+      - name: Publish synthetic QA report to temporary branch
+        shell: pwsh
+        run: |
+          git config user.name 'VoiceType CI'
+          git config user.email 'actions@users.noreply.github.com'
+          git checkout --orphan "ui-qa-$env:GITHUB_RUN_ID"
+          git rm -r --cached . *> $null
+          git add -f qa-output/
+          git commit -m 'Add synthetic Windows GUI smoke results' *> $null
+          git push origin "HEAD:refs/heads/ui-qa-$env:GITHUB_RUN_ID"
