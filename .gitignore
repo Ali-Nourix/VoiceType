@@ -2,3 +2,7 @@
 *.pdb
 
 /Cargo.lock
+
+# External design-skill installation; never commit third-party skill scripts.
+/.agents/
+/.codex/

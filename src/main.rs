@@ -3,10 +3,11 @@ mod audio;
 mod config;
 mod inject;
 mod speech;
+mod visual;
 
 use audio::{Event, Source};
 use config::Settings;
-use eframe::egui::{self, Color32, RichText, Vec2};
+use eframe::egui;
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -14,7 +15,7 @@ use global_hotkey::{
 use std::{
     str::FromStr,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc,
     },
@@ -25,18 +26,13 @@ use tray_icon::{
     MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
-const BG: Color32 = Color32::from_rgb(18, 20, 25);
-const PANEL: Color32 = Color32::from_rgb(29, 32, 39);
-const TEXT: Color32 = Color32::from_rgb(239, 240, 243);
-const MUTED: Color32 = Color32::from_rgb(163, 169, 181);
-const ACCENT: Color32 = Color32::from_rgb(156, 232, 194);
-
 #[derive(PartialEq)]
 enum State {
     Ready,
     Starting,
     Recording,
     Processing,
+    Cancelling,
 }
 struct App {
     settings: Settings,
@@ -48,6 +44,11 @@ struct App {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     stop: Option<Sender<()>>,
+    cancelled: Arc<AtomicBool>,
+    escape: Option<HotKey>,
+    bar_position: [f32; 2],
+    wave: Vec<f32>,
+    history: Vec<String>,
     level: Arc<AtomicU32>,
     started: Instant,
     hot_rx: Receiver<GlobalHotKeyEvent>,
@@ -130,16 +131,7 @@ impl App {
                 .push("arabic".into());
         }
         cc.egui_ctx.set_fonts(fonts);
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.override_text_color = Some(TEXT);
-        style.visuals.panel_fill = BG;
-        style.visuals.widgets.noninteractive.bg_fill = PANEL;
-        style.visuals.widgets.inactive.bg_fill = PANEL;
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 49, 55);
-        style.visuals.selection.bg_fill = ACCENT;
-        style.spacing.item_spacing = Vec2::new(10.0, 10.0);
-        cc.egui_ctx.set_style(style);
+        visual::setup(&cc.egui_ctx);
         let (hot_tx, hot_rx) = mpsc::channel();
         let wake = cc.egui_ctx.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |event| {
@@ -186,6 +178,11 @@ impl App {
             tx,
             rx,
             stop: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            escape: None,
+            bar_position: [30., 30.],
+            wave: vec![0.; 14],
+            history: Vec::new(),
             level: Arc::new(AtomicU32::new(0)),
             started: Instant::now(),
             hot_rx,
@@ -203,6 +200,15 @@ impl App {
         match self.state {
             State::Ready => {
                 self.target = inject::target();
+                self.cancelled.store(false, Ordering::Release);
+                self.wave = vec![0.; 14];
+                self.bar_position = bar_position(ctx.pixels_per_point());
+                let escape = HotKey::new(None, Code::Escape);
+                if let Some(mgr) = &self.manager {
+                    if mgr.register(escape).is_ok() {
+                        self.escape = Some(escape);
+                    }
+                }
                 self.state = State::Starting;
                 self.message = "Opening audio device…".into();
                 self.started = Instant::now();
@@ -217,12 +223,14 @@ impl App {
                 let tx = self.tx.clone();
                 let level = self.level.clone();
                 let wake = ctx.clone();
+                let cancelled = self.cancelled.clone();
                 std::thread::spawn(move || {
                     audio::run(
                         source,
                         lang,
                         speech::DEFAULT_KEY.to_owned(),
                         stop_rx,
+                        cancelled,
                         tx,
                         level,
                         wake,
@@ -236,7 +244,23 @@ impl App {
                 self.state = State::Processing;
                 self.message = "Finishing recording…".into();
             }
-            State::Processing => {}
+            State::Processing | State::Cancelling => {}
+        }
+    }
+    fn cancel(&mut self) {
+        if self.state == State::Ready || self.state == State::Cancelling {
+            return;
+        }
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.state = State::Cancelling;
+        self.message = "Cancelling… audio already sent cannot be recalled.".into();
+    }
+    fn clear_escape(&mut self) {
+        if let (Some(mgr), Some(key)) = (&self.manager, self.escape.take()) {
+            let _ = mgr.unregister(key);
         }
     }
     fn restore_hotkey(&mut self, old: Option<HotKey>, next: HotKey) -> bool {
@@ -310,8 +334,19 @@ impl App {
     }
     fn events(&mut self, ctx: &egui::Context) {
         while let Ok(e) = self.hot_rx.try_recv() {
-            if e.state == HotKeyState::Pressed && self.hotkey.map(|h| h.id()) == Some(e.id) {
-                self.toggle(ctx);
+            if self.escape.map(|h| h.id()) == Some(e.id) && e.state == HotKeyState::Pressed {
+                self.cancel();
+            }
+            if self.hotkey.map(|h| h.id()) == Some(e.id) {
+                if e.state == HotKeyState::Pressed {
+                    if !self.settings.hold_to_talk || self.state == State::Ready {
+                        self.toggle(ctx);
+                    }
+                } else if self.settings.hold_to_talk
+                    && (self.state == State::Starting || self.state == State::Recording)
+                {
+                    self.toggle(ctx);
+                }
             }
         }
         while let Ok(e) = self.menu_rx.try_recv() {
@@ -347,10 +382,20 @@ impl App {
                     }
                 }
                 Event::Processing => {
-                    self.state = State::Processing;
-                    self.message = "Sending audio to Google…".into();
+                    if self.state != State::Cancelling {
+                        self.state = State::Processing;
+                        self.message = "Sending audio to Google…".into();
+                    }
                 }
                 Event::Finished(text) => {
+                    if self.cancelled.load(Ordering::Acquire) {
+                        self.state = State::Ready;
+                        self.stop = None;
+                        self.clear_escape();
+                        self.message = "Cancelled.".into();
+                        continue;
+                    }
+                    self.clear_escape();
                     let text =
                         if self.settings.language == "fa-IR" && self.settings.normalize_persian {
                             voicetype::core::normalize_persian(&text)
@@ -373,9 +418,18 @@ impl App {
                             "Transcript ready to copy.".into()
                         }
                     };
-                    self.last_text = text;
+                    self.last_text = text.clone();
+                    self.history.insert(0, text);
+                    self.history.truncate(20);
+                }
+                Event::Cancelled => {
+                    self.clear_escape();
+                    self.state = State::Ready;
+                    self.stop = None;
+                    self.message = "Cancelled.".into();
                 }
                 Event::Failed(e) => {
+                    self.clear_escape();
                     self.state = State::Ready;
                     self.stop = None;
                     self.message = e;
@@ -394,17 +448,48 @@ impl App {
         )
     }
 }
-fn visual_text(s: &str) -> String {
-    if !s.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c)) {
-        return s.to_owned();
+fn bar_position(scale: f32) -> [f32; 2] {
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+        UI::WindowsAndMessaging::GetCursorPos,
+    };
+    unsafe {
+        let mut p = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut p);
+        let mon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut info) != 0 {
+            let r = info.rcWork;
+            return [
+                ((r.left + r.right) as f32 / 2.0 / scale - 135.0),
+                (r.bottom as f32 / scale - 82.0),
+            ];
+        }
     }
-    let shaped = arabic_reshaper::arabic_reshape(s);
-    let bidi = unicode_bidi::BidiInfo::new(&shaped, None);
-    bidi.paragraphs
-        .iter()
-        .map(|p| bidi.reorder_line(p, p.range.clone()).into_owned())
-        .collect::<Vec<_>>()
-        .join("\n")
+    [30., 30.]
+}
+fn make_bar_nonactivating() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
+    };
+    let title: Vec<u16> = "VoiceType Floating Bar"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        let h = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !h.is_null() {
+            let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
+            SetWindowLongPtrW(
+                h,
+                GWL_EXSTYLE,
+                style | WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize,
+            );
+        }
+    }
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
@@ -421,95 +506,78 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(100));
         if self.state == State::Recording {
-            let source = self.settings.source.clone();
-            let level = self.level.load(Ordering::Relaxed) as f32 / 1000.0;
+            self.wave
+                .push((self.level.load(Ordering::Relaxed) as f32 / 1000.).sqrt());
+            if self.wave.len() > 14 {
+                self.wave.remove(0);
+            }
+        }
+        let label = match self.state {
+            State::Ready => "Ready",
+            State::Starting => "Starting",
+            State::Recording => "Listening",
+            State::Processing => "Transcribing",
+            State::Cancelling => "Cancelling",
+        };
+        let shortcut = self.shortcut();
+        let display = visual::Display {
+            state: label,
+            hold_to_talk: self.settings.hold_to_talk,
+            status: &self.message,
+            source: &self.settings.source,
+            shortcut: &shortcut,
+            history: &self.history,
+            elapsed: self.started.elapsed().as_secs(),
+            wave: &self.wave,
+        };
+        let mut bar_action = None;
+        if self.state != State::Ready {
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("recording-pill"),
                 egui::ViewportBuilder::default()
-                    .with_title("VoiceType listening")
-                    .with_inner_size([240.0, 56.0])
-                    .with_position([30.0, 30.0])
+                    .with_title("VoiceType Floating Bar")
+                    .with_inner_size([270., 56.])
+                    .with_position(self.bar_position)
                     .with_decorations(false)
                     .with_taskbar(false)
                     .with_active(false)
+                    .with_transparent(true)
                     .with_always_on_top(),
                 |ctx, _| {
-                    egui::CentralPanel::default()
-                        .frame(
-                            egui::Frame::new()
-                                .fill(PANEL)
-                                .inner_margin(egui::Margin::same(12)),
-                        )
-                        .show(ctx, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("●").color(Color32::from_rgb(255, 158, 141)),
-                                );
-                                ui.label(RichText::new("Listening").strong());
-                                ui.label(RichText::new(source.clone()).small().color(MUTED));
-                                ui.label(
-                                    RichText::new(if level > 0.03 {
-                                        "▮▮▮"
-                                    } else {
-                                        "▮▮"
-                                    })
-                                    .color(ACCENT),
-                                );
-                            });
-                        });
+                    bar_action = visual::bar(ctx, &display);
                 },
             );
+            make_bar_nonactivating();
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(24))).show(ctx, |ui| {
-   ui.horizontal(|ui| {
-    ui.label(RichText::new("◉").size(22.0).color(ACCENT)); ui.label(RichText::new("VoiceType").size(20.0).strong());
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| { if ui.button(if self.settings_open { "Done" } else { "Settings" }).clicked() { self.draft=self.settings.clone(); self.settings_open=!self.settings_open; } });
-   });
-   ui.add_space(14.0); ui.separator(); ui.add_space(14.0);
-   if self.settings_open {
-    egui::ScrollArea::vertical().show(ui,|ui| {
-     ui.label(RichText::new("Settings").size(24.0).strong()); ui.label(RichText::new("Make VoiceType yours.").color(MUTED)); ui.add_space(12.0);
-     ui.label(RichText::new("GLOBAL SHORTCUT").small().color(MUTED));
-     ui.horizontal(|ui| { ui.checkbox(&mut self.draft.ctrl,"Ctrl"); ui.checkbox(&mut self.draft.alt,"Alt"); ui.checkbox(&mut self.draft.shift,"Shift");
-      egui::ComboBox::from_id_salt("key").selected_text(&self.draft.key).show_ui(ui,|ui| { for c in 'A'..='Z' { let k=c.to_string(); ui.selectable_value(&mut self.draft.key,k.clone(),k); } }); });
-     ui.add_space(8.0); ui.label(RichText::new("LANGUAGE").small().color(MUTED));
-     egui::ComboBox::from_id_salt("language").selected_text(if self.draft.language=="fa-IR"{"Persian · fa-IR"}else{"English · en-US"}).show_ui(ui,|ui| {ui.selectable_value(&mut self.draft.language,"fa-IR".into(),"Persian · fa-IR");ui.selectable_value(&mut self.draft.language,"en-US".into(),"English · en-US");});
-     ui.add_space(8.0); ui.label(RichText::new("AUDIO SOURCE").small().color(MUTED));
-     egui::ComboBox::from_id_salt("source").selected_text(&self.draft.source).show_ui(ui,|ui| {ui.selectable_value(&mut self.draft.source,"Microphone".into(),"Microphone");ui.selectable_value(&mut self.draft.source,"System audio".into(),"System audio · loopback");});
-     ui.add_space(8.0); ui.checkbox(&mut self.draft.auto_type,"Type into the focused app"); ui.checkbox(&mut self.draft.normalize_persian,"Normalize Persian ی and ک"); ui.checkbox(&mut self.draft.startup,"Launch at Windows startup");
-     ui.add_space(10.0); if ui.add_sized([130.0,40.0],egui::Button::new(RichText::new("Save changes").color(BG).strong()).fill(ACCENT)).clicked() {self.apply();}
-     ui.add_space(8.0); ui.label(RichText::new("Audio is sent to Google's Chromium speech endpoint. This unofficial endpoint may stop working. VoiceType · GPL-3.0 · No warranty.").size(12.0).color(MUTED));
-    });
-   } else {
-    ui.label(RichText::new("Less typing.\nMore flow.").size(31.0).strong());
-    ui.label(RichText::new("Your voice, wherever you write.").size(15.0).color(MUTED)); ui.add_space(22.0);
-    egui::Frame::new().fill(PANEL).corner_radius(12).inner_margin(egui::Margin::same(20)).show(ui,|ui| {
-     ui.set_min_width(ui.available_width());
-     ui.horizontal(|ui| { let (dot,label)=match self.state {State::Ready=>(ACCENT,"READY"),State::Starting|State::Recording=>(Color32::from_rgb(255,158,141),"LISTENING"),State::Processing=>(Color32::from_rgb(242,201,133),"PROCESSING")}; ui.label(RichText::new("●").color(dot));ui.label(RichText::new(label).size(12.0).strong().color(MUTED));
-      ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {ui.label(RichText::new(self.settings.source.clone()).small().color(MUTED));}); });
-     ui.add_space(14.0);
-     let (rect,_) = ui.allocate_exact_size(Vec2::new(ui.available_width(),42.0),egui::Sense::hover());
-     let amp=self.level.load(Ordering::Relaxed) as f32/1000.0; let painter=ui.painter();
-     let bars=36; let width=rect.width()/bars as f32;
-     for i in 0..bars {let t=(i as f32*0.6+self.started.elapsed().as_secs_f32()*6.0).sin().abs(); let h=if self.state==State::Recording { 4.0+amp*30.0*(0.3+0.7*t) } else {4.0}; let x=rect.left()+width*(i as f32+0.5); let y=rect.center().y; painter.line_segment([egui::pos2(x,y-h/2.0),egui::pos2(x,y+h/2.0)],egui::Stroke::new(3.0_f32,if self.state==State::Recording{ACCENT}else{Color32::from_rgb(78,85,91)}));}
-     ui.add_space(12.0);
-     let title=match self.state {State::Ready=>"Start recording",State::Starting|State::Recording=>"Stop & transcribe",State::Processing=>"Transcribing…"};
-     if ui.add_enabled(self.state!=State::Processing,egui::Button::new(RichText::new(title).color(BG).strong()).fill(ACCENT).min_size(Vec2::new(ui.available_width(),44.0))).clicked() {self.toggle(ctx);}
-     ui.add_space(6.0); ui.label(RichText::new(format!("{}  ·  Up to 30 seconds",self.shortcut())).size(12.0).color(MUTED));
-    });
-    ui.add_space(18.0); ui.horizontal(|ui| {ui.label(RichText::new("LATEST TRANSCRIPT").size(11.0).strong().color(MUTED));ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if !self.last_text.is_empty() && ui.button("Copy").clicked(){ctx.copy_text(self.last_text.clone());self.message="Copied to clipboard.".into();}});});
-    ui.add_space(5.0);
-    egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {if self.last_text.is_empty(){ui.label(RichText::new("Your words will appear here.").color(MUTED));}else{ui.label(RichText::new(visual_text(&self.last_text)).size(16.0));}});
-   }
-   ui.add_space(12.0); ui.separator(); ui.label(RichText::new(&self.message).size(12.0).color(MUTED));
-  });
+        let actions = visual::hub(ctx, &display, &mut self.draft, &mut self.settings_open);
+        for action in actions.into_iter().chain(bar_action) {
+            match action {
+                visual::Action::Toggle => self.toggle(ctx),
+                visual::Action::Cancel => self.cancel(),
+                visual::Action::Copy(i) => {
+                    if let Some(t) = self.history.get(i) {
+                        ctx.copy_text(t.clone());
+                        self.message = "Copied to clipboard.".into();
+                    }
+                }
+                visual::Action::Save => self.apply(),
+                visual::Action::Hide => {
+                    if self.tray.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    } else {
+                        self.message = "System tray unavailable.".into();
+                    }
+                }
+            }
+        }
     }
 }
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 650.0])
-            .with_min_inner_size([390.0, 500.0]),
+            .with_inner_size([900.0, 700.0])
+            .with_min_inner_size([650.0, 510.0]),
         ..Default::default()
     };
     eframe::run_native(

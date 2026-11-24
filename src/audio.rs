@@ -1,7 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::{
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{Receiver, Sender},
         Arc, Mutex,
     },
@@ -19,6 +19,7 @@ pub enum Event {
     Processing,
     Finished(String),
     Failed(String),
+    Cancelled,
 }
 
 // A bounded capture prevents runaway memory use, even if the GUI loses the stop signal.
@@ -27,12 +28,17 @@ pub fn run(
     lang: String,
     key: String,
     stop: Receiver<()>,
+    cancelled: Arc<AtomicBool>,
     events: Sender<Event>,
     level: Arc<AtomicU32>,
     wake: eframe::egui::Context,
 ) {
-    if let Err(e) = record(source, &lang, &key, stop, &events, level, &wake) {
-        let _ = events.send(Event::Failed(e));
+    if let Err(e) = record(source, &lang, &key, stop, &events, level, &wake, &cancelled) {
+        let _ = events.send(if cancelled.load(Ordering::Acquire) {
+            Event::Cancelled
+        } else {
+            Event::Failed(e)
+        });
         wake.request_repaint();
     }
 }
@@ -44,6 +50,7 @@ fn record(
     events: &Sender<Event>,
     level: Arc<AtomicU32>,
     wake: &eframe::egui::Context,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
     let host = cpal::default_host();
     let device = match source {
@@ -114,6 +121,11 @@ fn record(
     }
     drop(stream);
     level.store(0, Ordering::Relaxed);
+    if cancelled.load(Ordering::Acquire) {
+        let _ = events.send(Event::Cancelled);
+        wake.request_repaint();
+        return Ok(());
+    }
     let _ = events.send(Event::Processing);
     wake.request_repaint();
     let samples = buffer
@@ -123,8 +135,17 @@ fn record(
     if pcm.len() < 3200 {
         return Err("Recording was too short or silent. Try again.".into());
     }
+    if cancelled.load(Ordering::Acquire) {
+        let _ = events.send(Event::Cancelled);
+        wake.request_repaint();
+        return Ok(());
+    }
     let text = crate::speech::transcribe(pcm, lang, key)?;
-    let _ = events.send(Event::Finished(text));
+    let _ = events.send(if cancelled.load(Ordering::Acquire) {
+        Event::Cancelled
+    } else {
+        Event::Finished(text)
+    });
     wake.request_repaint();
     Ok(())
 }

@@ -12,6 +12,7 @@ pub struct Settings {
     pub startup: bool,
     pub auto_type: bool,
     pub normalize_persian: bool,
+    pub hold_to_talk: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -25,6 +26,7 @@ impl Default for Settings {
             startup: false,
             auto_type: true,
             normalize_persian: true,
+            hold_to_talk: false,
         }
     }
 }
@@ -47,6 +49,7 @@ pub fn save(settings: &Settings) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(p, bytes).map_err(|e| e.to_string())
 }
+#[cfg(target_os = "windows")]
 pub fn set_startup(enabled: bool) -> Result<(), String> {
     use winreg::{enums::*, RegKey};
     let root = RegKey::predef(HKEY_CURRENT_USER);
